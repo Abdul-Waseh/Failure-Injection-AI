@@ -4,13 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
-	"time"
 
 	"github.com/failure-injection-ai/shared/middleware"
 	"github.com/failure-injection-ai/shared/telemetry"
@@ -37,7 +35,7 @@ func main() {
 	businessProxy := httputil.NewSingleHostReverseProxy(businessURL)
 
 	// Wrap proxies with OTel
-    // Note: otelhttp.NewHandler automatically extracts/injects trace context
+	// Note: otelhttp.NewHandler automatically extracts/injects trace context
 	authHandler := otelhttp.NewHandler(authProxy, "proxy_auth")
 	businessHandler := otelhttp.NewHandler(businessProxy, "proxy_business")
 
@@ -63,14 +61,14 @@ func main() {
 		}
 	})
 
-    // Health check
-    mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-        w.WriteHeader(http.StatusOK)
-        w.Write([]byte("OK"))
-    })
+	// Health check
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	})
 
 	// 4. Apply Chaos Middleware
-    // The chaos middleware runs BEFORE the proxy, so if we inject latency here, the user sees it.
+	// The chaos middleware runs BEFORE the proxy, so if we inject latency here, the user sees it.
 	finalHandler := middleware.ChaosMiddleware(otelhttp.NewHandler(mux, "gateway-server"))
 
 	port := os.Getenv("PORT")
