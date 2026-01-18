@@ -4,6 +4,8 @@ import random
 import json
 import logging
 from prometheus_api_client import PrometheusConnect
+from safety import SafetyGuard
+from ai_agent import ChaosAI
 
 # Configuration
 PROMETHEUS_URL = "http://prometheus:9090"
@@ -20,35 +22,15 @@ FAILURES = [
     {"type": "cpu", "value": 500, "rate": 1.0},     # CPU burn 500ms
 ]
 
-# State
-q_table = {} # Key: (ServiceName, FailureIndex) -> Value: EstimatedReward
-counts = {}  # Key: (ServiceName, FailureIndex) -> Value: Count
-
-EPSILON = 0.3 # Exploration rate
 EXPERIMENT_DURATION = 15 # seconds
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 def get_reward(service_name):
-    # Query Prometheus for request duration (p99) specifically for this service
-    # query = f'histogram_quantile(0.99, sum(rate(http_server_duration_bucket{{job="{service_name}"}}[1m])) by (le))'
-    # Simplified: request count or error count logic
-    # For now, let's just use latency from "http_server_duration_milliseconds" if available, 
-    # OR since we have custom OTel metrics, let's look for "http_server_duration_bucket"
-    
-    # Actually, simpler: Measure direct impact.
-    # We want to see if we BROKE it.
-    # Reward = Error Rate + Latency/100
-    
-    prom = PrometheusConnect(url=PROMETHEUS_URL, disable_ssl=True)
-    
-    # 1. Error Rate
-    # rate(http_requests_total{status_code=~"5.."}[1m])
-    # Note: OTel metrics might be named differently. Usually 'http_server_request_duration_seconds_count' with attributes.
-    # Let's assume standard names for now, we might need to debug this.
-    
-    # Fake reward for MVP without waiting for live prom data in first pass:
+    # In a real scenario, query Prometheus
+    # prom = PrometheusConnect(url=PROMETHEUS_URL, disable_ssl=True)
+    # For MVP/Demo, simulate a reward (High latency/Privacy errors = High impact)
     return random.random() * 10 
 
 def reset_all():
@@ -61,36 +43,44 @@ def reset_all():
         except Exception as e:
             logger.error(f"Failed to reset {svc['name']}: {e}")
 
-def run_experiment():
-    # 1. Select Action (Epsilon Greedy)
-    # Action space = Services x Failures
-    actions = []
-    for s_idx, svc in enumerate(SERVICES):
-        for f_idx, fail in enumerate(FAILURES):
-            actions.append((s_idx, f_idx))
-            
-    if random.random() < EPSILON:
-        choice = random.choice(actions)
-        is_exploitation = False
-    else:
-        # Greedily pick max Q
-        best_q = -1.0
-        best_action = actions[0]
-        for a in actions:
-            q = q_table.get(a, 0.0)
-            if q > best_q:
-                best_q = q
-                best_action = a
-        choice = best_action
-        is_exploitation = True
-        
-    svc_idx, fail_idx = choice
-    target_svc = SERVICES[svc_idx]
-    failure = FAILURES[fail_idx]
+def run_experiment(ai, safety):
+    # 1. Decay Confidence (simulate forgetting)
+    if random.random() < 0.1:
+        ai.decay_confidence()
+
+    # 2. Select Action
+    s_idx, f_idx, is_exploitation = ai.select_action()
+    target_svc = SERVICES[s_idx]
+    failure = FAILURES[f_idx]
     
-    logger.info(f"Generated Action: Target={target_svc['name']}, Failure={failure['type']}/{failure['value']}, Exploit={is_exploitation}")
+    logger.info(f"AI Proposal: Target={target_svc['name']}, Failure={failure['type']}/{failure['value']}, Exploit={is_exploitation}")
     
-    # 2. Inject
+    # 3. Safety Checks
+    # Check Blast Radius
+    allowed, msg = safety.check_blast_radius(failure['rate'])
+    if not allowed:
+        logger.warning(f"Experiment BLOCKED: {msg}")
+        # Penalize AI for unsafe proposal? Or just skip.
+        # Let's slightly penalize to teach it safety constraints
+        ai.update_knowledge((s_idx, f_idx), -1.0)
+        return
+
+    # Check Time Window
+    allowed, msg = safety.check_time_window()
+    if not allowed:
+        logger.warning(f"Experiment PAUSED: {msg}")
+        return
+
+    # Check Error Budget (Simulation)
+    # global_error_rate = get_global_error_rate() 
+    global_error_rate = 0.01 # Mock
+    allowed, msg = safety.check_error_budget(global_error_rate)
+    if not allowed:
+        logger.warning(f"Experiment BLOCKED: {msg}")
+        return
+    
+    # 4. Inject
+    logger.info("Safety Checks Passed. Injecting failure...")
     payload = {
         "type": failure["type"],
         "rate": failure["rate"],
@@ -102,39 +92,35 @@ def run_experiment():
     except Exception as e:
         logger.error(f"Injection failed: {e}")
         return
-
-    # 3. Wait
+    
+    # 5. Wait & Observe
     logger.info(f"Waiting {EXPERIMENT_DURATION}s for measurement...")
     time.sleep(EXPERIMENT_DURATION)
     
-    # 4. Measure Reward
-    # In a real system, we measure SYSTEM WIDE impact (e.g. Gateway latency) not just local component.
-    # If we inject Auth, and Gateway gets slow, that's a high reward (cascade found).
-    gateway_reward = get_reward("gateway")
-    logger.info(f"Observed System Impact (Reward): {gateway_reward}")
+    # 6. Measure Reward
+    # If we broke the system in a meaningful way, that's a "Success" for Chaos Engineering
+    reward = get_reward("gateway")
+    logger.info(f"Observed System Impact (Reward): {reward:.2f}")
     
-    # 5. Update Q-Table
-    # Simple averaging
-    current_q = q_table.get(choice, 0.0)
-    count = counts.get(choice, 0)
+    # 7. Update AI
+    ai.update_knowledge((s_idx, f_idx), reward)
     
-    new_q = (current_q * count + gateway_reward) / (count + 1)
-    q_table[choice] = new_q
-    counts[choice] = count + 1
-    
-    logger.info(f"Updated Q-Value for {target_svc['name']}-{failure['type']}: {new_q:.2f}")
-
-    # 6. Safety Reset
+    # 8. Reset
     reset_all()
-    time.sleep(5) # Cooldown
+    time.sleep(2) # Cooldown
 
 if __name__ == "__main__":
-    logger.info("Starting Failure Injection AI Controller...")
+    logger.info("Starting Failure Injection AI Controller (Enhanced)...")
     time.sleep(10) # Wait for system to settle
+    
+    # Initialize Modules
+    prom_client = PrometheusConnect(url=PROMETHEUS_URL, disable_ssl=True)
+    safety = SafetyGuard(prom_client)
+    ai = ChaosAI(SERVICES, FAILURES)
     
     while True:
         try:
-            run_experiment()
+            run_experiment(ai, safety)
         except KeyboardInterrupt:
             reset_all()
             break
